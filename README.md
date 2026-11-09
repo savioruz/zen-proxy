@@ -86,6 +86,26 @@ zen-proxy     # http://127.0.0.1:8787 — dashboard at /
 It stays up until you stop it, so you point your agent at it once and keep using it. `zen-claude` does this for you and cleans up after.
 </details>
 
+<details>
+<summary>Run with Docker or Docker Compose</summary>
+
+Run directly via Docker:
+```bash
+docker run -d \
+  --name zen-proxy \
+  --restart unless-stopped \
+  -p 8787:8787 \
+  -v "$(pwd)/data:/app/data" \
+  ghcr.io/savioruz/zen-proxy:latest
+```
+
+Or using Docker Compose:
+```bash
+cd contrib && docker compose up -d
+```
+See [`contrib/README.md`](contrib/README.md) for full configuration options and environment variables.
+</details>
+
 ---
 
 ## What you get
