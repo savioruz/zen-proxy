@@ -16,6 +16,8 @@ services:
       # - ZEN_KEY=${ZEN_KEY:-}
       # - PROXY_KEY=${PROXY_KEY:-}
       # - UPSTREAM=${UPSTREAM:-}
+      # - PROXY_POOL=${PROXY_POOL:-}
+      # - PROXY_STRATEGY=${PROXY_STRATEGY:-round-robin}
     volumes:
       - ./data:/app/data
     healthcheck:

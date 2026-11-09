@@ -118,6 +118,7 @@ See [`contrib/README.md`](contrib/README.md) for full configuration options and 
 | `POST /v1/messages/count_tokens` | Anthropic token estimate |
 | `GET /v1/models` | What's live right now |
 | Automatic fallback | Retries the next free model on `429` / `5xx` / unavailable |
+| Proxy pool | Outbound HTTP/HTTPS proxy pool with Round-Robin & auto-failover (ala 9router) |
 | Model aliases | Call it `gpt-4o`, get a free model back |
 | Auth | Anonymous `Bearer public`, or bring your own Zen key |
 | Dashboard | `http://127.0.0.1:8787/` |

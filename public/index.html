@@ -352,6 +352,7 @@ textarea { resize:vertical; min-height:96px; font-family:var(--mono); font-size:
     <div class="nav-indicator" id="navIndicator"></div>
     <button data-tab="overview" class="active">Overview</button>
     <button data-tab="models">Models</button>
+    <button data-tab="proxies">Proxy Pool</button>
     <button data-tab="config">Settings</button>
     <button data-tab="logs">Logs</button>
   </nav>
@@ -402,6 +403,44 @@ textarea { resize:vertical; min-height:96px; font-family:var(--mono); font-size:
         <input class="grow" id="newModel" placeholder="add a model id, e.g. nemotron-3-ultra-free">
         <button onclick="addModel()">+ Add</button>
       </div>
+    </div>
+  </section>
+
+  <section class="tab" id="tab-proxies">
+    <div class="panel">
+      <h2><span class="hh">Proxy Pool</span><span class="badge mut" id="proxyCount">0 proxies</span></h2>
+      <p class="hint" style="margin-bottom:16px">Route outbound upstream requests through external HTTP/HTTPS proxies (ala 9router) to bypass IP rate limits (429) and Cloudflare blocks. Supports automatic failover and multiple rotation strategies.</p>
+      
+      <div class="row" style="margin:0 0 16px;gap:12px;align-items:center">
+        <label style="margin:0;font-weight:bold">Rotation Strategy:</label>
+        <select id="proxyStrategySelect" onchange="updateProxyStrategy()" style="padding:7px 12px;border:var(--line);border-radius:6px;background:var(--paper);font-family:var(--mono);font-size:12px">
+          <option value="round-robin">Round-Robin (Rotate evenly across all active proxies)</option>
+          <option value="fallback">Fallback (Use primary proxy, failover on 429/5xx)</option>
+          <option value="random">Random</option>
+        </select>
+      </div>
+
+      <table id="proxyTable">
+        <thead>
+          <tr>
+            <th>Status</th>
+            <th>Proxy URL</th>
+            <th>Protocol</th>
+            <th>Latency</th>
+            <th>Fails</th>
+            <th style="text-align:right">Actions</th>
+          </tr>
+        </thead>
+        <tbody id="proxyTableBody">
+          <!-- Populated dynamically via JS -->
+        </tbody>
+      </table>
+
+      <div class="row" style="margin-top:18px;gap:8px">
+        <input class="grow" id="newProxyUrl" placeholder="http://user:password@proxy.example.com:8080 or http://127.0.0.1:8080">
+        <button class="primary" onclick="addProxyFromUI()">+ Add Proxy</button>
+      </div>
+      <p class="hint" style="margin-top:8px">Credentials (user:pass) are securely stored and masked in the UI. Passwords are never sent back to the browser.</p>
     </div>
   </section>
 
@@ -868,6 +907,7 @@ function switchTab(name) {
   if (name === "logs") loadLogs()
   if (name === "models") refreshModels()
   if (name === "overview") refreshStatus()
+  if (name === "proxies") refreshProxies()
 }
 document.querySelectorAll("nav button").forEach((b) => b.addEventListener("click", () => switchTab(b.dataset.tab)))
 
@@ -936,8 +976,139 @@ function jsStr(s) {
   return JSON.stringify(String(s ?? "")).replace(/'/g, "\\x27").replace(/&/g, "\\u0026")
 }
 
+let proxyPoolData = []
+
+async function refreshProxies() {
+  try {
+    const res = await api("/api/config")
+    const cfg = res.config || {}
+    proxyPoolData = cfg.proxyPool || []
+    if ($("proxyCount")) $("proxyCount").textContent = `${proxyPoolData.length} ${proxyPoolData.length === 1 ? 'proxy' : 'proxies'}`
+    if ($("proxyStrategySelect")) $("proxyStrategySelect").value = cfg.proxyStrategy || "round-robin"
+    renderProxyTable()
+  } catch (err) {
+    toast("Failed to load proxies: " + err.message, "bad")
+  }
+}
+
+function renderProxyTable() {
+  const tbody = $("proxyTableBody")
+  if (!tbody) return
+  if (proxyPoolData.length === 0) {
+    tbody.innerHTML = '<tr><td colspan="6" style="text-align:center;padding:24px;color:var(--muted)">No proxies configured yet. Outbound requests connect directly to upstream.</td></tr>'
+    return
+  }
+  tbody.innerHTML = proxyPoolData.map((p, idx) => {
+    const statusClass = !p.enabled ? "mut" : p.status === "active" ? "ok" : "warn"
+    const statusLabel = !p.enabled ? "Disabled" : p.status === "active" ? "Active" : "Degraded"
+    const latencyLabel = p.latency != null ? `${p.latency}ms` : (p.lastChecked ? "Tested" : "—")
+    return `
+      <tr>
+        <td><span class="badge ${statusClass}">${statusLabel}</span></td>
+        <td class="mono">${escapeHtml(p.url)}</td>
+        <td><span class="badge mut">${escapeHtml((p.protocol || 'http:').replace(':', '').toUpperCase())}</span></td>
+        <td class="mono">${latencyLabel}</td>
+        <td>${p.failCount || 0}</td>
+        <td style="text-align:right">
+          <div class="row" style="justify-content:flex-end;gap:6px">
+            <button type="button" class="small" onclick="testProxyItem(${idx})" style="padding:4px 8px;font-size:10px">⚡ Test</button>
+            <button type="button" class="small" onclick="toggleProxyItem(${idx})" style="padding:4px 8px;font-size:10px">${p.enabled ? 'Pause' : 'Enable'}</button>
+            <button type="button" class="small" onclick="deleteProxyItem(${idx})" style="padding:4px 8px;font-size:10px;color:var(--coral)">✕</button>
+          </div>
+        </td>
+      </tr>
+    `
+  }).join("")
+}
+
+async function addProxyFromUI() {
+  const input = $("newProxyUrl")
+  const url = input.value.trim()
+  if (!url) return
+  try {
+    const testRes = await api("/api/proxy/test", {
+      method: "POST",
+      body: JSON.stringify({ proxyUrl: url }),
+    })
+    if (!testRes.ok) {
+      if (!confirm(`Proxy test failed (${testRes.error || 'Connection error'}). Add anyway?`)) {
+        return
+      }
+    } else {
+      toast(`Proxy verified! (${testRes.latencyMs}ms)`, "ok")
+    }
+  } catch {}
+
+  proxyPoolData.push({
+    url,
+    enabled: true,
+    status: "active",
+  })
+  input.value = ""
+  await saveProxyPoolSettings()
+}
+
+async function toggleProxyItem(idx) {
+  if (!proxyPoolData[idx]) return
+  proxyPoolData[idx].enabled = !proxyPoolData[idx].enabled
+  await saveProxyPoolSettings()
+}
+
+async function deleteProxyItem(idx) {
+  if (!proxyPoolData[idx]) return
+  proxyPoolData.splice(idx, 1)
+  await saveProxyPoolSettings()
+}
+
+async function testProxyItem(idx) {
+  const p = proxyPoolData[idx]
+  if (!p) return
+  toast("Testing proxy...", "mut")
+  try {
+    const res = await api("/api/proxy/test", {
+      method: "POST",
+      body: JSON.stringify({ proxyUrl: p.url }),
+    })
+    if (res.ok) {
+      p.status = "active"
+      p.failCount = 0
+      p.latency = res.latencyMs
+      p.lastChecked = Date.now()
+      toast(`Proxy OK (${res.latencyMs}ms)`, "ok")
+    } else {
+      p.status = "degraded"
+      p.failCount = (p.failCount || 0) + 1
+      toast(`Proxy error: ${res.error || res.statusText || 'failed'}`, "bad")
+    }
+    renderProxyTable()
+  } catch (e) {
+    toast("Test failed: " + e.message, "bad")
+  }
+}
+
+async function updateProxyStrategy() {
+  await saveProxyPoolSettings()
+}
+
+async function saveProxyPoolSettings() {
+  try {
+    const strategy = $("proxyStrategySelect") ? $("proxyStrategySelect").value : "round-robin"
+    await api("/api/config", {
+      method: "PUT",
+      body: JSON.stringify({
+        proxyPool: proxyPoolData,
+        proxyStrategy: strategy,
+      }),
+    })
+    toast("Proxy pool saved", "ok")
+    await refreshProxies()
+  } catch (err) {
+    toast("Failed to save proxy pool: " + err.message, "bad")
+  }
+}
+
 async function refreshAll() {
-  try { await refreshStatus(); await refreshModels() } catch (e) { if (e.message === "unauthorized") showAuth() }
+  try { await refreshStatus(); await refreshModels(); await refreshProxies() } catch (e) { if (e.message === "unauthorized") showAuth() }
 }
 
 if (key) {

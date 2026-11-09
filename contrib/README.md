@@ -50,7 +50,18 @@ This directory contains configuration files for deploying **zen-proxy** via Dock
 ## Data Persistence
 
 Configuration changes made through the web UI (or initial setup) are stored in `./data/zen-proxy.json`.
-The `./data` directory is mounted into the container at `/app/data`, ensuring your API keys, models, and settings persist across container restarts and image updates without file-lock or inode detachment issues.
+The `./data` directory is mounted into the container at `/app/data`, ensuring your API keys, models, proxy pool settings, and preferences persist across container restarts and image updates without file-lock or inode detachment issues.
+
+---
+
+## Outbound Proxy Pool (ala 9router)
+
+To route outbound requests through external HTTP/HTTPS proxies, either configure them directly in the Web UI under the **Proxy Pool** tab, or set the `PROXY_POOL` variable in `.env`:
+
+```env
+PROXY_POOL=http://user:pass@proxy1.example.com:8080,http://proxy2.example.com:8080
+PROXY_STRATEGY=round-robin
+```
 
 ---
 
