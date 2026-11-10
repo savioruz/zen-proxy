@@ -1,5 +1,8 @@
 #!/usr/bin/env node
 import http from "node:http"
+import https from "node:https"
+import tls from "node:tls"
+import net from "node:net"
 import fs from "node:fs"
 import path from "node:path"
 import { randomBytes, createHash, timingSafeEqual } from "node:crypto"
@@ -293,6 +296,304 @@ function envNum(name, dflt) {
   return Number.isFinite(n) ? n : dflt
 }
 
+function parseProxyUrl(raw) {
+  if (!raw) return null
+  try {
+    const rawUrl = typeof raw === "object" ? raw.url : raw
+    if (!rawUrl || typeof rawUrl !== "string") return null
+    const u = new URL(rawUrl)
+    if (u.protocol !== "http:" && u.protocol !== "https:") return null
+    const id = (typeof raw === "object" && raw.id) || "proxy-" + createHash("sha1").update(u.href).digest("hex").slice(0, 8)
+    const enabled = typeof raw === "object" && "enabled" in raw ? Boolean(raw.enabled) : true
+    const status = (typeof raw === "object" && raw.status) || "active"
+    const failCount = (typeof raw === "object" && Number(raw.failCount)) || 0
+    const lastChecked = (typeof raw === "object" && raw.lastChecked) || 0
+    const latency = (typeof raw === "object" && raw.latency) || null
+    const port = u.port || (u.protocol === "https:" ? "443" : "80")
+    const auth = u.username ? `${decodeURIComponent(u.username)}:${decodeURIComponent(u.password)}` : ""
+    const cleanUrl = u.pathname === "/" && !rawUrl.endsWith("/") ? u.href.slice(0, -1) : u.href
+    return {
+      id,
+      url: cleanUrl,
+      protocol: u.protocol,
+      hostname: u.hostname,
+      port,
+      auth,
+      enabled,
+      status,
+      failCount,
+      lastChecked,
+      latency,
+    }
+  } catch {
+    return null
+  }
+}
+
+function maskProxyUrl(url) {
+  try {
+    const u = new URL(url)
+    if (!u.username && !u.password) return url
+    const trail = url.endsWith("/") ? "/" : ""
+    const pathPart = u.pathname === "/" ? trail : u.pathname
+    return `${u.protocol}//${u.username ? encodeURIComponent(decodeURIComponent(u.username)) : ""}:***@${u.host}${pathPart}${u.search}`
+  } catch {
+    return url
+  }
+}
+
+function dispatchError(handler, err, controller = null) {
+  if (typeof handler.onResponseError === "function") {
+    handler.onResponseError(controller, err)
+  } else if (typeof handler.onError === "function") {
+    handler.onError(err)
+  }
+}
+
+function dispatchResponse(handler, res) {
+  const controller = {
+    pause() { res.pause() },
+    resume() { res.resume() },
+  }
+
+  // Node 24+ / Undici v7: handler.onResponseStart(controller, status, headers, statusText)
+  // Node 18, 20, 22 / Undici v5-v6: handler.onHeaders(status, headers, resume, statusText)
+  if (typeof handler.onResponseStart === "function") {
+    handler.onResponseStart(controller, res.statusCode, res.rawHeaders, res.statusMessage)
+  } else if (typeof handler.onHeaders === "function") {
+    handler.onHeaders(res.statusCode, res.rawHeaders, () => res.resume(), res.statusMessage)
+  }
+
+  res.on("data", (chunk) => {
+    if (typeof handler.onResponseData === "function") {
+      handler.onResponseData(controller, chunk)
+    } else if (typeof handler.onData === "function") {
+      handler.onData(chunk)
+    }
+  })
+
+  res.on("end", () => {
+    if (typeof handler.onResponseEnd === "function") {
+      handler.onResponseEnd(controller, [])
+    } else if (typeof handler.onComplete === "function") {
+      handler.onComplete([])
+    }
+  })
+
+  res.on("error", (err) => {
+    dispatchError(handler, err, controller)
+  })
+}
+
+function createProxyDispatcher(proxyInput, options = {}) {
+  const p = typeof proxyInput === "string" ? parseProxyUrl(proxyInput) : proxyInput
+  if (!p) return null
+  const timeoutMs = options.timeoutMs || 30000
+
+  return {
+    dispatch(opts, handler) {
+      const targetUrl = new URL(opts.path, opts.origin)
+      const isHttps = targetUrl.protocol === "https:"
+      const targetPort = targetUrl.port || (isHttps ? 443 : 80)
+
+      const writeBody = (stream) => {
+        if (!opts.body) {
+          stream.end()
+          return
+        }
+        if (typeof opts.body.pipe === "function") {
+          opts.body.pipe(stream)
+        } else if (typeof opts.body === "string" || Buffer.isBuffer(opts.body)) {
+          stream.end(opts.body)
+        } else if (typeof opts.body[Symbol.asyncIterator] === "function") {
+          (async () => {
+            try {
+              for await (const chunk of opts.body) stream.write(chunk)
+              stream.end()
+            } catch (err) {
+              stream.destroy(err)
+            }
+          })()
+        } else {
+          stream.end()
+        }
+      }
+
+      if (isHttps) {
+        const connectHeaders = { host: `${targetUrl.hostname}:${targetPort}` }
+        if (p.auth) {
+          connectHeaders["proxy-authorization"] = "Basic " + Buffer.from(p.auth).toString("base64")
+        }
+        const reqLib = p.protocol === "https:" ? https : http
+        const connectReq = reqLib.request({
+          host: p.hostname,
+          port: Number(p.port),
+          method: "CONNECT",
+          path: `${targetUrl.hostname}:${targetPort}`,
+          headers: connectHeaders,
+          timeout: timeoutMs,
+        })
+
+        connectReq.on("connect", (res, socket, head) => {
+          if (res.statusCode !== 200) {
+            socket.destroy()
+            dispatchError(handler, new Error(`Proxy CONNECT rejected with ${res.statusCode}`))
+            return
+          }
+          const tlsSocket = tls.connect({
+            socket,
+            servername: targetUrl.hostname,
+          }, () => {
+            const clientReq = https.request({
+              createConnection: () => tlsSocket,
+              path: targetUrl.pathname + targetUrl.search,
+              method: opts.method,
+              headers: { ...opts.headers, host: targetUrl.host },
+            }, (upstreamRes) => {
+              dispatchResponse(handler, upstreamRes)
+            })
+
+            clientReq.on("error", (err) => dispatchError(handler, err))
+            writeBody(clientReq)
+          })
+          tlsSocket.on("error", (err) => dispatchError(handler, err))
+        })
+
+        connectReq.on("timeout", () => {
+          connectReq.destroy(new Error("Proxy CONNECT timeout"))
+        })
+        connectReq.on("error", (err) => dispatchError(handler, err))
+        connectReq.end()
+        return true
+      } else {
+        const reqHeaders = { ...opts.headers, host: targetUrl.host }
+        if (p.auth) {
+          reqHeaders["proxy-authorization"] = "Basic " + Buffer.from(p.auth).toString("base64")
+        }
+        const reqLib = p.protocol === "https:" ? https : http
+        const forwardReq = reqLib.request({
+          host: p.hostname,
+          port: Number(p.port),
+          path: targetUrl.href,
+          method: opts.method,
+          headers: reqHeaders,
+          timeout: timeoutMs,
+        }, (res) => {
+          dispatchResponse(handler, res)
+        })
+
+        forwardReq.on("timeout", () => {
+          forwardReq.destroy(new Error("Proxy request timeout"))
+        })
+        forwardReq.on("error", (err) => dispatchError(handler, err))
+        writeBody(forwardReq)
+        return true
+      }
+    },
+  }
+}
+
+class ProxyPool {
+  constructor(proxies = [], options = {}) {
+    this.proxies = []
+    this.strategy = options.strategy || "round-robin"
+    this.failThreshold = options.failThreshold || 3
+    this.cooldownMs = options.cooldownMs || 60000
+    this.roundRobinIndex = 0
+    this.dispatchers = new Map()
+    this.setProxies(proxies)
+  }
+
+  setProxies(list) {
+    if (!Array.isArray(list)) {
+      this.proxies = []
+      return
+    }
+    this.proxies = list.map((item) => parseProxyUrl(item)).filter(Boolean)
+  }
+
+  getActiveProxies() {
+    const now = Date.now()
+    return this.proxies.filter((p) => {
+      if (!p.enabled) return false
+      if (p.status === "degraded" && p.degradedAt && now - p.degradedAt > this.cooldownMs) {
+        p.status = "active"
+        p.failCount = 0
+        p.degradedAt = null
+      }
+      return p.status === "active"
+    })
+  }
+
+  getNext() {
+    const active = this.getActiveProxies()
+    if (active.length === 0) return null
+
+    if (this.strategy === "fallback") {
+      return active[0]
+    }
+    if (this.strategy === "random") {
+      const idx = Math.floor(Math.random() * active.length)
+      return active[idx]
+    }
+    const item = active[this.roundRobinIndex % active.length]
+    this.roundRobinIndex = (this.roundRobinIndex + 1) % active.length
+    return item
+  }
+
+  getDispatcher(proxy) {
+    if (!proxy) return null
+    let d = this.dispatchers.get(proxy.url)
+    if (!d) {
+      d = createProxyDispatcher(proxy)
+      this.dispatchers.set(proxy.url, d)
+    }
+    return d
+  }
+
+  getNextDispatcher() {
+    const p = this.getNext()
+    if (!p) return null
+    return {
+      proxy: p,
+      dispatcher: this.getDispatcher(p),
+    }
+  }
+
+  reportResult(urlOrProxy, ok, statusCode = 200, latencyMs = null) {
+    const url = typeof urlOrProxy === "object" ? urlOrProxy.url : urlOrProxy
+    const p = this.proxies.find((x) => x.url === url)
+    if (!p) return
+    p.lastChecked = Date.now()
+    if (latencyMs != null) p.latency = latencyMs
+
+    if (ok) {
+      p.failCount = 0
+      p.status = "active"
+      p.degradedAt = null
+    } else {
+      p.failCount = (p.failCount || 0) + 1
+      if (p.failCount >= this.failThreshold || statusCode === 429) {
+        p.status = "degraded"
+        p.degradedAt = Date.now()
+      }
+    }
+  }
+}
+
+function envProxyPool(name, dflt = []) {
+  const raw = ENV[name]
+  if (!raw) return dflt
+  try {
+    const parsed = JSON.parse(raw)
+    if (Array.isArray(parsed)) return parsed
+  } catch {}
+  if (typeof raw === "string" && raw.includes(",")) {
+    return raw.split(",").map((s) => s.trim()).filter(Boolean)
+  }
+  return [raw.trim()]
+}
+
 const DEFAULT_CONFIG = {
   host: ENV.HOST ?? "127.0.0.1",
   port: envNum("PORT", 8787),
@@ -351,6 +652,10 @@ const DEFAULT_CONFIG = {
   cacheMs: envNum("CACHE_MS", 30000),
   autoSync: ENV.AUTO_SYNC !== "0",
   autoSyncIntervalMs: envNum("AUTO_SYNC_MS", 3600000),
+  // Proxy Pool (ala 9router): pool of outbound HTTP/HTTPS forward proxies
+  proxyPool: envProxyPool("PROXY_POOL", []),
+  proxyStrategy: ENV.PROXY_STRATEGY ?? "round-robin",
+  proxyRetryLimit: envNum("PROXY_RETRY_LIMIT", 3),
 }
 
 // True when the user's own config carries an explicit model list. While it is
@@ -359,6 +664,7 @@ const DEFAULT_CONFIG = {
 // in the dashboard (or sets FALLBACK_MODELS), and "Restore defaults" flips it
 // back.
 let fallbackModelsPinned = false
+let proxyPool = null
 
 // A corrupt config file must not look like a missing one. The old catch-all
 // said nothing and silently ran on defaults, so a typo in zen-proxy.json
@@ -404,6 +710,10 @@ function loadConfig() {
         log(`upstream migrated to ${upstream} (the legacy /zen/v1 base is no longer served)`)
       } catch {}
     }
+    if (typeof proxyPool !== "undefined" && proxyPool) {
+      proxyPool.setProxies(merged.proxyPool || [])
+      proxyPool.strategy = merged.proxyStrategy || "round-robin"
+    }
     return merged
   } catch (err) {
     fallbackModelsPinned = false
@@ -416,6 +726,7 @@ function loadConfig() {
 }
 
 let config = loadConfig()
+proxyPool = new ProxyPool(config.proxyPool, { strategy: config.proxyStrategy })
 let uiHtml = ""
 try {
   uiHtml = fs.readFileSync(UI_PATH, "utf8")
@@ -474,6 +785,10 @@ function saveConfig(next) {
   const forDisk = unpin || !fallbackModelsPinned ? { ...merged, fallbackModels: undefined } : merged
   writeConfigFile(forDisk)
   config = merged
+  if (proxyPool) {
+    if (merged.proxyPool) proxyPool.setProxies(merged.proxyPool)
+    if (merged.proxyStrategy) proxyPool.strategy = merged.proxyStrategy
+  }
   return merged
 }
 
@@ -487,6 +802,16 @@ function sanitize(cfg) {
   const out = { ...cfg }
   if (out.proxyKey) out.proxyKey = "••••••••"
   if (out.defaultZenKey) out.defaultZenKey = maskKey(out.defaultZenKey)
+  if (Array.isArray(out.proxyPool)) {
+    out.proxyPool = out.proxyPool.map((p) => {
+      const parsed = typeof p === "string" ? parseProxyUrl(p) : p
+      if (!parsed) return p
+      return {
+        ...parsed,
+        url: maskProxyUrl(parsed.url),
+      }
+    })
+  }
   return out
 }
 
@@ -1685,16 +2010,23 @@ async function handleMessages(req, res) {
       delayMs = 0
       let upstreamRes
       const wall = isStream ? headersWall() : null
+      const outbound = proxyPool ? proxyPool.getNextDispatcher() : null
       try {
-        upstreamRes = await fetch(`${config.upstream}${format === "responses" ? "/responses" : "/chat/completions"}`, {
+        const fetchOpts = {
           method: "POST",
           headers: zenHeaders(req, auth),
           body: JSON.stringify(payload),
           signal: isStream ? wall.signal : AbortSignal.timeout(config.timeoutMs),
-        })
+        }
+        if (outbound?.dispatcher) fetchOpts.dispatcher = outbound.dispatcher
+        if (outbound?.proxy?.url) fetchOpts.proxy = outbound.proxy.url
+        const start = Date.now()
+        upstreamRes = await fetch(`${config.upstream}${format === "responses" ? "/responses" : "/chat/completions"}`, fetchOpts)
         if (wall) wall.release()
+        if (outbound) proxyPool.reportResult(outbound.proxy, upstreamRes.ok, upstreamRes.status, Date.now() - start)
       } catch (err) {
         if (wall) wall.release()
+        if (outbound) proxyPool.reportResult(outbound.proxy, false, 502)
         lastErr = { error: { type: "api_error", message: err.message } }
         lastStatus = 502
         if (attempt < retries) {
@@ -1939,16 +2271,23 @@ async function handleChat(req, res, responsesRoute = false) {
       delayMs = 0
       let upstreamRes
       const wall = isStream ? headersWall() : null
+      const outbound = proxyPool ? proxyPool.getNextDispatcher() : null
       try {
-        upstreamRes = await fetch(`${config.upstream}${format === "responses" ? "/responses" : "/chat/completions"}`, {
+        const fetchOpts = {
           method: "POST",
           headers: zenHeaders(req, auth),
           body: JSON.stringify(payload),
           signal: isStream ? wall.signal : AbortSignal.timeout(config.timeoutMs),
-        })
+        }
+        if (outbound?.dispatcher) fetchOpts.dispatcher = outbound.dispatcher
+        if (outbound?.proxy?.url) fetchOpts.proxy = outbound.proxy.url
+        const start = Date.now()
+        upstreamRes = await fetch(`${config.upstream}${format === "responses" ? "/responses" : "/chat/completions"}`, fetchOpts)
         if (wall) wall.release()
+        if (outbound) proxyPool.reportResult(outbound.proxy, upstreamRes.ok, upstreamRes.status, Date.now() - start)
       } catch (err) {
         if (wall) wall.release()
+        if (outbound) proxyPool.reportResult(outbound.proxy, false, 502)
         lastErr = { error: { type: "upstream_error", message: err.message } }
         lastStatus = 502
         if (attempt < retries) {
@@ -2935,12 +3274,17 @@ async function probeModel(id, auth) {
     headers["x-session-id"] = session
   }
   if (config.tracing) for (const [k, v] of Object.entries(traceHeaders())) headers[k] = v
-  const r = await fetch(`${config.upstream}${format === "responses" ? "/responses" : "/chat/completions"}`, {
+  const outbound = proxyPool ? proxyPool.getNextDispatcher() : null
+  const probeOpts = {
     method: "POST",
     headers,
     body: JSON.stringify(agentProbePayload(id, format)),
     signal: AbortSignal.timeout(Math.min(config.timeoutMs, 30_000)),
-  })
+  }
+  if (outbound?.dispatcher) probeOpts.dispatcher = outbound.dispatcher
+  if (outbound?.proxy?.url) probeOpts.proxy = outbound.proxy.url
+  const r = await fetch(`${config.upstream}${format === "responses" ? "/responses" : "/chat/completions"}`, probeOpts)
+  if (outbound) proxyPool.reportResult(outbound.proxy, r.ok, r.status)
   // A live model answers the streamed probe with SSE, and sync only needs the
   // status. Hang up instead of waiting for the model to finish its "ping".
   if (r.ok) {
@@ -3845,6 +4189,25 @@ async function handleApiConfig(req, res) {
       if (typeof cleaned.modelAliases !== "object" || cleaned.modelAliases === null) {
         cleaned.modelAliases = config.modelAliases
       }
+      if (Array.isArray(cleaned.proxyPool)) {
+        cleaned.proxyPool = cleaned.proxyPool.map((p) => {
+          const parsed = typeof p === "string" ? parseProxyUrl(p) : p
+          if (!parsed) return null
+          const existing = (config.proxyPool || []).find((old) => (typeof old === "object" ? old.id === parsed.id : old === parsed.url))
+          if (existing && parsed.url && parsed.url.includes(":***@")) {
+            parsed.url = typeof existing === "object" ? existing.url : existing
+            const reParsed = parseProxyUrl(parsed)
+            return reParsed || parsed
+          }
+          return parseProxyUrl(parsed) || parsed
+        }).filter(Boolean)
+      } else {
+        cleaned.proxyPool = config.proxyPool
+      }
+      if (cleaned.proxyStrategy && !["round-robin", "fallback", "random"].includes(cleaned.proxyStrategy)) {
+        cleaned.proxyStrategy = config.proxyStrategy || "round-robin"
+      }
+      cleaned.proxyRetryLimit = num(cleaned.proxyRetryLimit ?? config.proxyRetryLimit, config.proxyRetryLimit ?? 3)
       saveConfig(cleaned)
       scheduleSync()
       scheduleUA()
@@ -3858,6 +4221,43 @@ async function handleApiConfig(req, res) {
     }
   }
   return json(res, 405, { error: "method not allowed" })
+}
+
+async function handleTestProxy(req, res) {
+  try {
+    const body = JSON.parse(await readBody(req))
+    const proxyUrl = body.proxyUrl || body.url
+    if (!proxyUrl || typeof proxyUrl !== "string") {
+      return json(res, 400, { ok: false, error: "proxyUrl is required" })
+    }
+    const parsed = parseProxyUrl(proxyUrl)
+    if (!parsed) {
+      return json(res, 400, { ok: false, error: "invalid proxy URL" })
+    }
+    const testUrl = body.testUrl || `${config.upstream}/models`
+    const dispatcher = createProxyDispatcher(parsed, { timeoutMs: 8000 })
+    const start = Date.now()
+    const r = await fetch(testUrl, {
+      method: "GET",
+      headers: { accept: "application/json" },
+      signal: AbortSignal.timeout(8000),
+      dispatcher,
+      proxy: parsed.url,
+    })
+    const latencyMs = Date.now() - start
+    proxyPool.reportResult(parsed.url, r.ok, r.status, latencyMs)
+    return json(res, 200, {
+      ok: r.ok,
+      status: r.status,
+      statusText: r.statusText,
+      latencyMs,
+    })
+  } catch (err) {
+    return json(res, 200, {
+      ok: false,
+      error: err.message,
+    })
+  }
 }
 
 async function handleStatus(req, res) {
@@ -3930,7 +4330,8 @@ async function handleTest(req, res) {
         ? `Bearer ${body.zenKey.trim()}`
         : (authForUpstream(req) ?? "Bearer public")
     const format = modelFormat(model)
-    const upstreamRes = await fetch(`${config.upstream}${format === "responses" ? "/responses" : "/chat/completions"}`, {
+    const outbound = proxyPool ? proxyPool.getNextDispatcher() : null
+    const testOpts = {
       method: "POST",
       headers: (() => {
         const h = {
@@ -3961,7 +4362,11 @@ async function handleTest(req, res) {
       // real client would get instead of a gate refusal it never earned.
       body: JSON.stringify(agentProbePayload(model, format)),
       signal: AbortSignal.timeout(config.timeoutMs),
-    })
+    }
+    if (outbound?.dispatcher) testOpts.dispatcher = outbound.dispatcher
+    if (outbound?.proxy?.url) testOpts.proxy = outbound.proxy.url
+    const upstreamRes = await fetch(`${config.upstream}${format === "responses" ? "/responses" : "/chat/completions"}`, testOpts)
+    if (outbound) proxyPool.reportResult(outbound.proxy, upstreamRes.ok, upstreamRes.status, Date.now() - start)
     if (upstreamRes.ok) {
       try { await upstreamRes.body?.cancel() } catch {}
     }
@@ -4075,6 +4480,10 @@ async function router(req, res) {
     if (p === "/api/config") return handleApiConfig(req, res)
     if (p === "/api/status" && req.method === "GET") return handleStatus(req, res)
     if (p === "/api/logs" && req.method === "GET") return handleLogs(req, res)
+    if (p === "/api/proxy/test" && req.method === "POST") {
+      if (!adminAuth(req, res) || !adminWriteGuard(req, res)) return
+      return handleTestProxy(req, res)
+    }
     // Mutating admin routes go through the same origin/content-type gate, so a
     // browser cannot forge a config change or a sync either.
     if (p === "/api/test" && req.method === "POST") {
@@ -4280,4 +4689,10 @@ export {
   SESSION_MAX_AGE_MS,
   MAX_BODY,
   VALID_MODEL_ID,
+  parseProxyUrl,
+  maskProxyUrl,
+  createProxyDispatcher,
+  ProxyPool,
+  proxyPool,
+  handleTestProxy,
 }

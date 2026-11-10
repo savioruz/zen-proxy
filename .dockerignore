@@ -1,0 +1,14 @@
+.git
+.github
+.gitignore
+node_modules
+npm-debug.log
+test
+scripts
+contrib
+*.md
+!README.md
+data
+zen-proxy.json
+*.tmp
+.DS_Store

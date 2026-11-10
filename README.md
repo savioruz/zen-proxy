@@ -86,6 +86,28 @@ zen-proxy     # http://127.0.0.1:8787 — dashboard at /
 It stays up until you stop it, so you point your agent at it once and keep using it. `zen-claude` does this for you and cleans up after.
 </details>
 
+<details>
+<summary>Run with Docker or Docker Compose</summary>
+
+The Docker image runs under the official **Bun** runtime (`oven/bun:1-alpine`), providing instant startup and satisfying OpenCode's TLS/HTTP fingerprinting out of the box.
+
+Run directly via Docker:
+```bash
+docker run -d \
+  --name zen-proxy \
+  --restart unless-stopped \
+  -p 8787:8787 \
+  -v "$(pwd)/data:/app/data" \
+  ghcr.io/savioruz/zen-proxy:latest
+```
+
+Or using Docker Compose:
+```bash
+cd contrib && docker compose up -d
+```
+See [`contrib/README.md`](contrib/README.md) for full configuration options and environment variables.
+</details>
+
 ---
 
 ## What you get
@@ -98,6 +120,7 @@ It stays up until you stop it, so you point your agent at it once and keep using
 | `POST /v1/messages/count_tokens` | Anthropic token estimate |
 | `GET /v1/models` | What's live right now |
 | Automatic fallback | Retries the next free model on `429` / `5xx` / unavailable |
+| Proxy pool | Outbound HTTP/HTTPS proxy pool with Round-Robin & auto-failover (ala 9router) |
 | Model aliases | Call it `gpt-4o`, get a free model back |
 | Auth | Anonymous `Bearer public`, or bring your own Zen key |
 | Dashboard | `http://127.0.0.1:8787/` |

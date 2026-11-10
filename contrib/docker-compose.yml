@@ -1,0 +1,28 @@
+services:
+  zen-proxy:
+    image: ghcr.io/savioruz/zen-proxy:latest
+    build:
+      context: ..
+      dockerfile: Dockerfile
+    container_name: zen-proxy
+    restart: unless-stopped
+    ports:
+      - "${PORT:-8787}:8787"
+    environment:
+      - HOST=0.0.0.0
+      - PORT=8787
+      - ZEN_PROXY_CONFIG=/app/data/zen-proxy.json
+      # Optional environment overrides (can also be configured via Web UI):
+      # - ZEN_KEY=${ZEN_KEY:-}
+      # - PROXY_KEY=${PROXY_KEY:-}
+      # - UPSTREAM=${UPSTREAM:-}
+      # - PROXY_POOL=${PROXY_POOL:-}
+      # - PROXY_STRATEGY=${PROXY_STRATEGY:-round-robin}
+    volumes:
+      - ./data:/app/data
+    healthcheck:
+      test: ["CMD", "bun", "-e", "fetch('http://127.0.0.1:8787/health').then(r=>process.exit(r.ok?0:1)).catch(()=>process.exit(1))"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      start_period: 5s
