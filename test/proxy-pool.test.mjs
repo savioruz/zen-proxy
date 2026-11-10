@@ -141,12 +141,64 @@ describe("Proxy Dispatcher", () => {
 
     try {
       const dispatcher = createProxyDispatcher(`http://127.0.0.1:${mockProxyPort}`)
-      const res = await fetch(`http://127.0.0.1:${targetPort}/api/hello`, { dispatcher })
+      const res = await fetch(`http://127.0.0.1:${targetPort}/api/hello`, {
+        dispatcher,
+        proxy: `http://127.0.0.1:${mockProxyPort}`,
+      })
       const data = await res.json()
       assert.equal(res.status, 200)
       assert.equal(data.ok, true)
       assert.equal(targetHits, 1)
       assert.ok(proxyRequests.some((r) => r.url.includes(`/api/hello`)))
+    } finally {
+      await new Promise((r) => targetServer.close(r))
+    }
+  })
+
+  test("supports legacy onHeaders/onData/onComplete undici handler (Node 18/20/22)", async () => {
+    let targetHits = 0
+    const targetServer = http.createServer((req, res) => {
+      targetHits++
+      res.writeHead(200, { "content-type": "application/json" })
+      res.end(JSON.stringify({ legacy: true }))
+    })
+    await new Promise((r) => targetServer.listen(0, "127.0.0.1", r))
+    const targetPort = targetServer.address().port
+
+    try {
+      const dispatcher = createProxyDispatcher(`http://127.0.0.1:${mockProxyPort}`)
+      let headersCalled = false
+      let dataChunks = []
+      let completeCalled = false
+
+      const legacyHandler = {
+        onHeaders(status, headers, resume, statusText) {
+          headersCalled = true
+          assert.equal(status, 200)
+        },
+        onData(chunk) {
+          dataChunks.push(chunk)
+        },
+        onComplete() {
+          completeCalled = true
+        },
+        onError(err) {
+          assert.fail("should not error: " + err.message)
+        },
+      }
+
+      dispatcher.dispatch({
+        origin: `http://127.0.0.1:${targetPort}`,
+        path: "/legacy-test",
+        method: "GET",
+        headers: {},
+      }, legacyHandler)
+
+      await new Promise((r) => setTimeout(r, 100))
+      assert.ok(headersCalled, "onHeaders must be called")
+      assert.ok(completeCalled, "onComplete must be called")
+      const body = Buffer.concat(dataChunks).toString("utf8")
+      assert.equal(JSON.parse(body).legacy, true)
     } finally {
       await new Promise((r) => targetServer.close(r))
     }

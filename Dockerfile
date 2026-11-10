@@ -1,4 +1,4 @@
-FROM node:alpine
+FROM oven/bun:1-alpine
 
 LABEL org.opencontainers.image.title="zen-proxy" \
       org.opencontainers.image.description="Zero-dependency local proxy unlocking OpenCode Zen free models" \
@@ -6,16 +6,16 @@ LABEL org.opencontainers.image.title="zen-proxy" \
 
 WORKDIR /app
 
-# Ensure data directory exists with correct permissions for non-root user
-RUN mkdir -p /app/data && chown -R node:node /app
+# Ensure data directory exists with correct permissions for non-root bun user
+RUN mkdir -p /app/data && chown -R bun:bun /app
 
 # Copy application files
-COPY --chown=node:node package.json zen-proxy.mjs models.json agent-tools.json agent-preamble.txt ./
-COPY --chown=node:node public ./public
-COPY --chown=node:node assets ./assets
-COPY --chown=node:node claude ./claude
+COPY --chown=bun:bun package.json zen-proxy.mjs models.json agent-tools.json agent-preamble.txt ./
+COPY --chown=bun:bun public ./public
+COPY --chown=bun:bun assets ./assets
+COPY --chown=bun:bun claude ./claude
 
-USER node
+USER bun
 
 ENV NODE_ENV=production \
     HOST=0.0.0.0 \
@@ -27,6 +27,6 @@ VOLUME ["/app/data"]
 EXPOSE 8787
 
 HEALTHCHECK --interval=30s --timeout=5s --start-period=5s --retries=3 \
-  CMD wget -q --spider http://127.0.0.1:8787/health || exit 1
+  CMD ["bun", "-e", "fetch('http://127.0.0.1:8787/health').then(r=>process.exit(r.ok?0:1)).catch(()=>process.exit(1))"]
 
-CMD ["node", "zen-proxy.mjs"]
+CMD ["bun", "zen-proxy.mjs"]

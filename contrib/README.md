@@ -1,6 +1,6 @@
 # Running zen-proxy with Docker & Docker Compose
 
-This directory contains configuration files for deploying **zen-proxy** via Docker and Docker Compose.
+This directory contains configuration files for deploying **zen-proxy** via Docker and Docker Compose. The Docker container runs under the official **Bun** runtime (`oven/bun:1-alpine`), ensuring seamless compatibility with OpenCode's gateway TLS/HTTP fingerprinting.
 
 ## Prerequisites
 

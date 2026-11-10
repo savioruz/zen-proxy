@@ -89,6 +89,8 @@ It stays up until you stop it, so you point your agent at it once and keep using
 <details>
 <summary>Run with Docker or Docker Compose</summary>
 
+The Docker image runs under the official **Bun** runtime (`oven/bun:1-alpine`), providing instant startup and satisfying OpenCode's TLS/HTTP fingerprinting out of the box.
+
 Run directly via Docker:
 ```bash
 docker run -d \

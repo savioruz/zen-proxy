@@ -342,6 +342,49 @@ function maskProxyUrl(url) {
   }
 }
 
+function dispatchError(handler, err, controller = null) {
+  if (typeof handler.onResponseError === "function") {
+    handler.onResponseError(controller, err)
+  } else if (typeof handler.onError === "function") {
+    handler.onError(err)
+  }
+}
+
+function dispatchResponse(handler, res) {
+  const controller = {
+    pause() { res.pause() },
+    resume() { res.resume() },
+  }
+
+  // Node 24+ / Undici v7: handler.onResponseStart(controller, status, headers, statusText)
+  // Node 18, 20, 22 / Undici v5-v6: handler.onHeaders(status, headers, resume, statusText)
+  if (typeof handler.onResponseStart === "function") {
+    handler.onResponseStart(controller, res.statusCode, res.rawHeaders, res.statusMessage)
+  } else if (typeof handler.onHeaders === "function") {
+    handler.onHeaders(res.statusCode, res.rawHeaders, () => res.resume(), res.statusMessage)
+  }
+
+  res.on("data", (chunk) => {
+    if (typeof handler.onResponseData === "function") {
+      handler.onResponseData(controller, chunk)
+    } else if (typeof handler.onData === "function") {
+      handler.onData(chunk)
+    }
+  })
+
+  res.on("end", () => {
+    if (typeof handler.onResponseEnd === "function") {
+      handler.onResponseEnd(controller, [])
+    } else if (typeof handler.onComplete === "function") {
+      handler.onComplete([])
+    }
+  })
+
+  res.on("error", (err) => {
+    dispatchError(handler, err, controller)
+  })
+}
+
 function createProxyDispatcher(proxyInput, options = {}) {
   const p = typeof proxyInput === "string" ? parseProxyUrl(proxyInput) : proxyInput
   if (!p) return null
@@ -394,7 +437,7 @@ function createProxyDispatcher(proxyInput, options = {}) {
         connectReq.on("connect", (res, socket, head) => {
           if (res.statusCode !== 200) {
             socket.destroy()
-            handler.onResponseError(null, new Error(`Proxy CONNECT rejected with ${res.statusCode}`))
+            dispatchError(handler, new Error(`Proxy CONNECT rejected with ${res.statusCode}`))
             return
           }
           const tlsSocket = tls.connect({
@@ -407,26 +450,19 @@ function createProxyDispatcher(proxyInput, options = {}) {
               method: opts.method,
               headers: { ...opts.headers, host: targetUrl.host },
             }, (upstreamRes) => {
-              const controller = {
-                pause() { upstreamRes.pause() },
-                resume() { upstreamRes.resume() },
-              }
-              handler.onResponseStart(controller, upstreamRes.statusCode, upstreamRes.rawHeaders, upstreamRes.statusMessage)
-              upstreamRes.on("data", (chunk) => handler.onResponseData(controller, chunk))
-              upstreamRes.on("end", () => handler.onResponseEnd(controller, []))
-              upstreamRes.on("error", (err) => handler.onResponseError(controller, err))
+              dispatchResponse(handler, upstreamRes)
             })
 
-            clientReq.on("error", (err) => handler.onResponseError(null, err))
+            clientReq.on("error", (err) => dispatchError(handler, err))
             writeBody(clientReq)
           })
-          tlsSocket.on("error", (err) => handler.onResponseError(null, err))
+          tlsSocket.on("error", (err) => dispatchError(handler, err))
         })
 
         connectReq.on("timeout", () => {
           connectReq.destroy(new Error("Proxy CONNECT timeout"))
         })
-        connectReq.on("error", (err) => handler.onResponseError(null, err))
+        connectReq.on("error", (err) => dispatchError(handler, err))
         connectReq.end()
         return true
       } else {
@@ -443,20 +479,13 @@ function createProxyDispatcher(proxyInput, options = {}) {
           headers: reqHeaders,
           timeout: timeoutMs,
         }, (res) => {
-          const controller = {
-            pause() { res.pause() },
-            resume() { res.resume() },
-          }
-          handler.onResponseStart(controller, res.statusCode, res.rawHeaders, res.statusMessage)
-          res.on("data", (chunk) => handler.onResponseData(controller, chunk))
-          res.on("end", () => handler.onResponseEnd(controller, []))
-          res.on("error", (err) => handler.onResponseError(controller, err))
+          dispatchResponse(handler, res)
         })
 
         forwardReq.on("timeout", () => {
           forwardReq.destroy(new Error("Proxy request timeout"))
         })
-        forwardReq.on("error", (err) => handler.onResponseError(null, err))
+        forwardReq.on("error", (err) => dispatchError(handler, err))
         writeBody(forwardReq)
         return true
       }
@@ -1990,6 +2019,7 @@ async function handleMessages(req, res) {
           signal: isStream ? wall.signal : AbortSignal.timeout(config.timeoutMs),
         }
         if (outbound?.dispatcher) fetchOpts.dispatcher = outbound.dispatcher
+        if (outbound?.proxy?.url) fetchOpts.proxy = outbound.proxy.url
         const start = Date.now()
         upstreamRes = await fetch(`${config.upstream}${format === "responses" ? "/responses" : "/chat/completions"}`, fetchOpts)
         if (wall) wall.release()
@@ -2250,6 +2280,7 @@ async function handleChat(req, res, responsesRoute = false) {
           signal: isStream ? wall.signal : AbortSignal.timeout(config.timeoutMs),
         }
         if (outbound?.dispatcher) fetchOpts.dispatcher = outbound.dispatcher
+        if (outbound?.proxy?.url) fetchOpts.proxy = outbound.proxy.url
         const start = Date.now()
         upstreamRes = await fetch(`${config.upstream}${format === "responses" ? "/responses" : "/chat/completions"}`, fetchOpts)
         if (wall) wall.release()
@@ -3251,6 +3282,7 @@ async function probeModel(id, auth) {
     signal: AbortSignal.timeout(Math.min(config.timeoutMs, 30_000)),
   }
   if (outbound?.dispatcher) probeOpts.dispatcher = outbound.dispatcher
+  if (outbound?.proxy?.url) probeOpts.proxy = outbound.proxy.url
   const r = await fetch(`${config.upstream}${format === "responses" ? "/responses" : "/chat/completions"}`, probeOpts)
   if (outbound) proxyPool.reportResult(outbound.proxy, r.ok, r.status)
   // A live model answers the streamed probe with SSE, and sync only needs the
@@ -4210,6 +4242,7 @@ async function handleTestProxy(req, res) {
       headers: { accept: "application/json" },
       signal: AbortSignal.timeout(8000),
       dispatcher,
+      proxy: parsed.url,
     })
     const latencyMs = Date.now() - start
     proxyPool.reportResult(parsed.url, r.ok, r.status, latencyMs)
@@ -4331,6 +4364,7 @@ async function handleTest(req, res) {
       signal: AbortSignal.timeout(config.timeoutMs),
     }
     if (outbound?.dispatcher) testOpts.dispatcher = outbound.dispatcher
+    if (outbound?.proxy?.url) testOpts.proxy = outbound.proxy.url
     const upstreamRes = await fetch(`${config.upstream}${format === "responses" ? "/responses" : "/chat/completions"}`, testOpts)
     if (outbound) proxyPool.reportResult(outbound.proxy, upstreamRes.ok, upstreamRes.status, Date.now() - start)
     if (upstreamRes.ok) {
